@@ -12,6 +12,8 @@ from shkeeper.modules.classes.crypto import Crypto
 from .utils import format_decimal, remove_exponent
 from .exceptions import NotRelatedToAnyInvoice
 
+from typing import List, Optional, Tuple
+
 
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -69,6 +71,7 @@ class Wallet(db.Model):
     recalc = db.Column(db.Integer, default=0)
     confirmations = db.Column(db.Integer, default=1)
     bkey = db.Column(db.String)
+    pdest_secondary = db.Column(db.String)
 
     @classmethod
     def register_currency(cls, crypto):
@@ -84,7 +87,8 @@ class Wallet(db.Model):
         db.session.commit()
         return wallet
 
-    def do_payout(self):
+    def do_payout(self) -> dict:
+        """Execute payout based on wallet settings."""
         if not self.payout:
             return False
 
@@ -93,17 +97,70 @@ class Wallet(db.Model):
 
         crypto = Crypto.instances[self.crypto]
         balance = crypto.balance()
-        res = crypto.mkpayout(
-            self.pdest, balance, self.pfee, subtract_fee_from_amount=True
-        )
+        
+        if self.ppolicy == PayoutPolicy.LIMIT:
+            # Проверяем есть ли второй адрес
+            if not self.pdest_secondary:
+                # Если второго адреса нет - работаем по старой схеме
+                res = crypto.mkpayout(
+                    self.pdest, 
+                    balance, 
+                    self.pfee,
+                    subtract_fee_from_amount=True
+                )
+            else:
+                # Делим сумму поровну между двумя адресами
+                split_amount = balance / 2
+                
+                # Первый перевод
+                res1 = crypto.mkpayout(
+                    self.pdest,
+                    split_amount,
+                    self.pfee,
+                    subtract_fee_from_amount=True
+                )
+                
+                # Второй перевод
+                res2 = crypto.mkpayout(
+                    self.pdest_secondary,
+                    split_amount,
+                    self.pfee, 
+                    subtract_fee_from_amount=True
+                )
+                
+                # Объединяем результаты
+                res = {
+                    "result": [],
+                    "error": None
+                }
+                
+                if "result" in res1 and res1["result"]:
+                    if isinstance(res1["result"], list):
+                        res["result"].extend(res1["result"])
+                    else:
+                        res["result"].append(res1["result"])
+                        
+                if "result" in res2 and res2["result"]:
+                    if isinstance(res2["result"], list):
+                        res["result"].extend(res2["result"])
+                    else:
+                        res["result"].append(res2["result"])
+                        
+                if res1.get("error") or res2.get("error"):
+                    res["error"] = {
+                        "message": f"Errors in payout: {res1.get('error')}, {res2.get('error')}"
+                    }
 
-        if "result" in res and res["result"]:
-            idtxs = (
-                res["result"] if isinstance(res["result"], list) else [res["result"]]
-            )
-            Payout.add(
-                {"dest": self.pdest, "amount": balance, "txids": idtxs}, crypto.crypto
-            )
+            if "result" in res and res["result"]:
+                idtxs = res["result"] if isinstance(res["result"], list) else [res["result"]]
+                Payout.add(
+                    {
+                        "dest": f"{self.pdest}, {self.pdest_secondary}" if self.pdest_secondary else self.pdest,
+                        "amount": balance,
+                        "txids": idtxs
+                    },
+                    crypto.crypto
+                )
 
         return res
 
